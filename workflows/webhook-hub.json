@@ -1,0 +1,2914 @@
+{
+  "name": "Webhook Integration Hub \u2014 Signed, Idempotent, Dead-Lettered",
+  "nodes": [
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000001",
+      "name": "note-1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1560,
+        -520
+      ],
+      "parameters": {
+        "content": "## Signed, replay-safe ingress\nA public webhook URL is a public **write endpoint** into the client's CRM. So nothing is trusted before three checks pass:\n\n1. **HMAC-SHA256 over the RAW bytes** \u2014 `{id}.{ts}.{body}`, the Standard Webhooks construction (Svix et al.), compared **timing-safe**. Signing a re-serialized parse is a classic broken implementation; this reads the raw buffer the request arrived with.\n2. **Timestamp tolerance \u00b1300s** \u2014 a captured request can't be re-sent later.\n3. **Event-id dedupe** \u2014 a captured request can't be re-sent *inside* the window either. Replay protection needs **both**; either alone has a hole.\n\n**Two lanes:** a request carrying `X-GHL-Signature` is verified as a GoHighLevel marketplace delivery \u2014 **Ed25519 over the raw body**, the scheme that replaces the legacy RSA `X-WH-Signature` on **September 1, 2026**. Everything else must pass the Standard Webhooks HMAC checks above. GHL's signature carries no timestamp, so on that lane replay defence is the event-id dedupe \u2014 scoped honestly, not hand-waved.",
+        "height": 520,
+        "width": 760,
+        "color": 2
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000002",
+      "name": "Inbound Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1560,
+        60
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hub/inbound",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "webhookId": "d5e4f3a2-0000-4000-8000-000000000001"
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000003",
+      "name": "Hub Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1340,
+        60
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "s0",
+              "name": "hub_secret",
+              "value": "demo-hub-secret-rotate-per-client",
+              "type": "string"
+            },
+            {
+              "id": "s1",
+              "name": "tolerance_s",
+              "value": "={{ 300 }}",
+              "type": "number"
+            },
+            {
+              "id": "s2",
+              "name": "future_skew_s",
+              "value": "={{ 30 }}",
+              "type": "number"
+            },
+            {
+              "id": "s3",
+              "name": "retention_h",
+              "value": "={{ 72 }}",
+              "type": "number"
+            },
+            {
+              "id": "s4",
+              "name": "location_id",
+              "value": "YOUR_GHL_LOCATION_ID",
+              "type": "string"
+            },
+            {
+              "id": "s5",
+              "name": "ghl_ed25519_pems",
+              "value": "=[\"-----BEGIN PUBLIC KEY-----\\nMCowBQYDK2VwAyEAi2HR1srL4o18O8BRa7gVJY7G7bupbN3H9AwJrHCDiOg=\\n-----END PUBLIC KEY-----\", \"-----BEGIN PUBLIC KEY-----\\nMCowBQYDK2VwAyEAIjPUavhA/dmHNTeFuXK0KKVA5Ig+uMfXCip0X3JzPdM=\\n-----END PUBLIC KEY-----\"]",
+              "type": "array"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000004",
+      "name": "Verify Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1120,
+        60
+      ],
+      "parameters": {
+        "jsCode": "\n// HMAC over the RAW request bytes. rawBody:true delivers them as binary `data`;\n// signing a JSON.stringify() of the parse would be a different byte stream.\nconst crypto = require('crypto');\nconst cfg = $('Hub Config').first().json;\nconst it = $input.first();\nconst h = it.json.headers ?? {};\nconst id = h['webhook-id'];\nconst ts = h['webhook-timestamp'];\nconst sigHeader = h['webhook-signature'] ?? '';\n\nconst binKeys = Object.keys(it.binary ?? {});\nconst raw = binKeys.length\n  ? Buffer.from(await this.helpers.getBinaryDataBuffer(0, binKeys[0]))\n  : Buffer.from(JSON.stringify(it.json.body ?? {}));\n\n// \u2500\u2500 Lane 1: GoHighLevel marketplace-app signature (X-GHL-Signature, Ed25519) \u2500\u2500\n// GHL signs the raw body only \u2014 no timestamp travels inside the signature, so\n// replay defence on this lane is the event-id dedupe alone. Stated honestly.\nconst ghlSig = h['x-ghl-signature'];\nif (ghlSig) {\n  let ok = false;\n  for (const pem of (cfg.ghl_ed25519_pems ?? [])) {\n    try {\n      if (crypto.verify(null, raw, pem, Buffer.from(String(ghlSig), 'base64'))) { ok = true; break; }\n    } catch (e) {}\n  }\n  const gid = id ?? ('ghl_' + crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24));\n  return [{ json: {\n    event_id: gid,\n    source: h['x-hub-source'] ?? 'ghl-app',\n    lane: 'ghl-ed25519',\n    authentic: ok,\n    reasons: ok ? [] : ['x-ghl-signature failed Ed25519 verification'],\n    body: it.json.body ?? null,\n  } }];\n}\n\n// \u2500\u2500 Lane 2: generic senders \u2014 Standard Webhooks HMAC \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst reasons = [];\nif (!id) reasons.push('missing webhook-id header');\nif (!ts) reasons.push('missing webhook-timestamp header');\nif (!sigHeader) reasons.push('missing webhook-signature header');\n\nconst now = Math.floor(Date.now() / 1000);\nconst tsN = parseInt(ts, 10);\nif (ts && !Number.isFinite(tsN)) reasons.push('unparseable timestamp');\nif (Number.isFinite(tsN)) {\n  if (now - tsN > cfg.tolerance_s) reasons.push(`stale timestamp: ${now - tsN}s old, limit ${cfg.tolerance_s}s`);\n  if (tsN - now > cfg.future_skew_s) reasons.push(`timestamp ${tsN - now}s in the future`);\n}\n\n// Standard Webhooks: sign `${id}.${timestamp}.` + raw body, base64 HMAC-SHA256.\n// The header may carry several space-delimited `v1,<sig>` entries (key rotation).\nlet match = false;\nif (id && ts) {\n  const expected = crypto.createHmac('sha256', cfg.hub_secret)\n    .update(`${id}.${ts}.`).update(raw).digest('base64');\n  const provided = String(sigHeader).split(/\\s+/)\n    .map(s => s.includes(',') ? s.split(',').slice(1).join(',') : s).filter(Boolean);\n  for (const p of provided) {\n    const a = Buffer.from(p), b = Buffer.from(expected);\n    if (a.length === b.length && crypto.timingSafeEqual(a, b)) match = true;  // timing-safe, never ===\n  }\n}\nif (!match) reasons.push('signature mismatch');\n\nreturn [{ json: {\n  event_id: id ?? null,\n  source: h['x-hub-source'] ?? 'unknown',\n  lane: 'standard-webhooks',\n  authentic: reasons.length === 0,\n  reasons,\n  body: it.json.body ?? null,\n} }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000005",
+      "name": "Authentic?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -900,
+        60
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.authentic }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000006",
+      "name": "Log Rejection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nreturn [{ json: {\n  kind: 'rejected', event_id: $json.event_id,\n  payload: JSON.stringify($json.body ?? null).slice(0, 500),\n  error_message: ($json.reasons ?? []).join('; '), source: $json.source,\n} }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000007",
+      "name": "Reject 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -240,
+        340
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: 'rejected', reasons: $('Verify Signature').item.json.reasons }) }}",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000008",
+      "name": "note-8",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -700,
+        -460
+      ],
+      "parameters": {
+        "content": "## Idempotency \u2014 duplicates are normal, not exceptional\nWebhook delivery is **at-least-once**. The sender's timeout fires, it redelivers, and a naive handler creates two contacts. GHL's own docs tell integrators to *store webhook IDs and make processing idempotent* \u2014 duplicates are expected behaviour, per the vendor.\n\nSo the event id is **reserved before any side effect**, and a duplicate delivery gets back the **recorded outcome of the first** \u2014 same answer, zero repeated work. You can't guarantee a message arrives once; you can guarantee its *effect* applies once.\n\nThe dedupe cache TTL (72h) must **outlive the sender's retry window** \u2014 a TTL shorter than the retries lets a day-two redelivery through as new.",
+        "height": 400,
+        "width": 660,
+        "color": 4
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000009",
+      "name": "Reserve Event ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        60
+      ],
+      "parameters": {
+        "jsCode": "\nconst cfg = $('Hub Config').first().json;\nconst sd = $getWorkflowStaticData('global');\nsd.seen = sd.seen ?? {};\nconst now = Date.now();\nconst ttlMs = cfg.retention_h * 3600 * 1000;\nfor (const [k, v] of Object.entries(sd.seen)) if (now - v.at > ttlMs) delete sd.seen[k];\n\nconst prior = sd.seen[$json.event_id];\nif (prior) {\n  return [{ json: { ...$json, duplicate: true,\n    first_seen_at: new Date(prior.at).toISOString(),\n    prior_outcome: prior.outcome ?? 'processing' } }];\n}\nsd.seen[$json.event_id] = { at: now };\nreturn [{ json: { ...$json, duplicate: false } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000010",
+      "name": "New Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -460,
+        60
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.duplicate }}",
+              "rightValue": "={{ false }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000011",
+      "name": "Duplicate Ack",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -240,
+        200
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ duplicate: true, event_id: $json.event_id, first_seen_at: $json.first_seen_at, outcome: $json.prior_outcome }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000012",
+      "name": "note-12",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        -420
+      ],
+      "parameters": {
+        "content": "## Ack fast. Work after.\nSenders time out in 5\u201315s and **retry anything slow \u2014 a slow handler manufactures its own duplicates.** This endpoint answers in well under a second; the GHL write happens *after* the response is already gone.\n\nAnd a malformed-but-authentic payload is **acked 200 and dead-lettered, never 500'd**: on GHL marketplace webhooks a non-2xx guarantees up to 12 redeliveries of the same poison message. Ack it, park it, page a human.",
+        "height": 300,
+        "width": 620,
+        "color": 5
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000013",
+      "name": "Parse Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        60
+      ],
+      "parameters": {
+        "jsCode": "\nlet body = $json.body;\nlet ok = true, err = null;\nif (typeof body === 'string') {\n  try { body = JSON.parse(body); } catch (e) { ok = false; err = 'unparseable body: ' + e.message; }\n}\nif (ok && (body == null || typeof body !== 'object' || Array.isArray(body))) {\n  ok = false; err = 'body is not a JSON object';\n}\nif (ok && typeof body.type !== 'string') { ok = false; err = 'missing event type field'; }\nreturn [{ json: { ...$json, body: ok ? body : null,\n  payload_excerpt: ok ? null : String($json.body ?? '').slice(0, 300),\n  parse_ok: ok, kind: ok ? null : 'poison', error_message: err } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000014",
+      "name": "Parsed OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        60
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.parse_ok }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000015",
+      "name": "Ack 202",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        200,
+        60
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ accepted: true, event_id: $json.event_id }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000016",
+      "name": "Ack Poison 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        200,
+        220
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ accepted: true, event_id: $json.event_id, note: 'payload parked for review' }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000017",
+      "name": "Route Event Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        420,
+        60
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.type }}",
+                    "rightValue": "contact.",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "contact"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.type }}",
+                    "rightValue": "appointment.",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "appointment"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000018",
+      "name": "Normalize Contact",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "\n// Normalise BEFORE the write. The dedupe key is the email, lowercased \u2014 never the\n// name (name matches aren't identity), and phone keeps its FULL digits: last-10\n// truncation turns a UK number into a real US stranger.\nlet loc = $json.location_id ?? null;\nif (!loc) { try { loc = $('Hub Config').first().json.location_id; } catch (e) {} }\nif (!loc) throw new Error('no location_id in context');\nconst b = $json.body;\nconst d = b.data ?? {};\nconst email = (d.email ?? '').toString().trim().toLowerCase() || null;\nconst digits = (d.phone ?? '').toString().replace(/[^\\d+]/g, '');\nconst phone = digits ? (digits.startsWith('+') ? digits : '+' + digits) : null;\nif (!email && !phone) throw new Error('no upsert key: contact event carries neither email nor phone');\nconst payload = {\n  locationId: loc,\n  ...(email ? { email } : {}),\n  ...(phone ? { phone } : {}),\n  ...(d.first_name ? { firstName: String(d.first_name) } : {}),\n  ...(d.last_name ? { lastName: String(d.last_name) } : {}),\n  source: 'hub:' + $json.source,                    // source stamping \u2014 attribution later\n  tags: ['src:' + $json.source, 'hub-synced'],      // tags are idempotent: twice = once\n};\nreturn [{ json: { ...$json, upsert_payload: payload } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000019",
+      "name": "GHL: Upsert Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        940,
+        -80
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/upsert",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.upsert_payload) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GHL Private Integration Token"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000020",
+      "name": "Normalize Appointment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        100
+      ],
+      "parameters": {
+        "jsCode": "\n// Appointment events stamp the contact: an idempotent tag, not an append.\nlet loc = $json.location_id ?? null;\nif (!loc) { try { loc = $('Hub Config').first().json.location_id; } catch (e) {} }\nif (!loc) throw new Error('no location_id in context');\nconst b = $json.body;\nconst d = b.data ?? {};\nconst email = (d.email ?? '').toString().trim().toLowerCase() || null;\nif (!email) throw new Error('appointment event carries no contact email');\nconst payload = {\n  locationId: loc, email,\n  source: 'hub:' + $json.source,\n  tags: ['src:' + $json.source, 'appt:' + (b.type.split('.')[1] ?? 'event')],\n};\nreturn [{ json: { ...$json, upsert_payload: payload } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000021",
+      "name": "GHL: Stamp Booking",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        940,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/upsert",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.upsert_payload) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "GHL Private Integration Token"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000022",
+      "name": "Record Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        10
+      ],
+      "parameters": {
+        "jsCode": "\n// Write the outcome back onto the reservation so a LATER duplicate delivery can\n// return it \u2014 the idempotent answer, not just an idempotent shrug.\nconst sd = $getWorkflowStaticData('global');\nsd.seen = sd.seen ?? {};\nlet ctx = {};\ntry { ctx = $('Route Event Type').item.json; } catch (e) { ctx = $json; }\nconst outcome = 'processed:' + (ctx.body?.type ?? 'event');\nif (ctx.event_id && sd.seen[ctx.event_id]) sd.seen[ctx.event_id].outcome = outcome;\nreturn [{ json: {\n  event_id: ctx.event_id ?? null, type: ctx.body?.type ?? null,\n  source: ctx.source ?? 'unknown', status: 'processed', outcome,\n  ghl_contact_id: $json.contact?.id ?? null,\n  received_at: new Date().toISOString() } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000023",
+      "name": "Log Event",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1460,
+        10
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_events"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_id": "={{ $json.event_id }}",
+            "type": "={{ $json.type }}",
+            "source": "={{ $json.source }}",
+            "status": "={{ $json.status }}",
+            "outcome": "={{ $json.outcome }}",
+            "received_at": "={{ $json.received_at }}"
+          },
+          "schema": [
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "type",
+              "displayName": "type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "outcome",
+              "displayName": "outcome",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000024",
+      "name": "note-24",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        620,
+        440
+      ],
+      "parameters": {
+        "content": "## The dead-letter path \u2014 where failures go to be SEEN\nThe SRE question is never \"is there a DLQ?\" It is: **what exactly lands here, who wakes up, and how do we replay without re-poisoning the flow?**\n\nFour kinds land here: `rejected` (bad signature), `poison` (authentic but malformed), `unroutable` (no route for the event type), `inbound_failed` (the CRM write itself failed \u2014 wired off the HTTP node's **error output**, which most builds leave unconnected).\n\nEvery row carries a **status lifecycle**: `new \u2192 fixed \u2192 replayed`. The replay endpoint only touches `fixed` rows \u2014 **root cause first, then replay**, or the same failure loops straight back in.\n\nThe **Guardrails node** (secretKeys \u2014 deterministic, no model attached) scrubs credentials out of every logged payload. Deliberately NOT `pii`: emails and phones are the CRM's own data, and redacting them would make dead letters unreplayable. That trade-off is a decision, so it's written here where a reviewer can disagree with it.",
+        "height": 520,
+        "width": 700,
+        "color": 3
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000025",
+      "name": "Shape For DLQ",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst j = $input.first().json;\nlet ctx = {};\ntry { ctx = $('Route Event Type').item.json; } catch (e) { ctx = j; }\nconst kind = j.kind ?? (j.error ? 'inbound_failed' : 'unroutable');\nconst err = j.error_message\n  ?? (j.error ? String(j.error.message ?? JSON.stringify(j.error)).slice(0, 300) : null)\n  ?? (kind === 'unroutable' ? `no route for event type \"${ctx.body?.type}\"` : 'unknown failure');\nreturn [{ json: {\n  kind,\n  event_id: ctx.event_id ?? j.event_id ?? null,\n  payload: JSON.stringify(ctx.body ?? j.body ?? j.payload_excerpt ?? null),\n  error_message: err,\n  source: ctx.source ?? j.source ?? 'unknown',\n} }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000026",
+      "name": "Scrub Secrets",
+      "type": "@n8n/n8n-nodes-langchain.guardrails",
+      "typeVersion": 2,
+      "position": [
+        940,
+        300
+      ],
+      "parameters": {
+        "operation": "sanitize",
+        "text": "={{ $json.payload }}",
+        "guardrails": {
+          "secretKeys": {
+            "value": {
+              "permissiveness": "balanced"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000027",
+      "name": "Dead-letter: Inbound",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_dlq"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "kind": "={{ $('Shape For DLQ').item.json.kind }}",
+            "event_id": "={{ $('Shape For DLQ').item.json.event_id }}",
+            "payload": "={{ $json.guardrailsInput }}",
+            "error": "={{ $('Shape For DLQ').item.json.error_message }}",
+            "attempt_count": "={{ 1 }}",
+            "status": "new",
+            "created_at": "={{ $now.toISO() }}",
+            "replayed_at": ""
+          },
+          "schema": [
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "payload",
+              "displayName": "payload",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "attempt_count",
+              "displayName": "attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "replayed_at",
+              "displayName": "replayed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000028",
+      "name": "Alert: Inbound Failure",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1460,
+        300
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_alerts"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "severity": "warning",
+            "message": "={{ 'inbound ' + $('Shape For DLQ').item.json.kind + ': ' + $('Shape For DLQ').item.json.error_message }}",
+            "ref": "={{ $('Shape For DLQ').item.json.event_id }}",
+            "at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ref",
+              "displayName": "ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "at",
+              "displayName": "at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000029",
+      "name": "note-29",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1560,
+        880
+      ],
+      "parameters": {
+        "content": "## Outbound \u2014 a retry ladder, not a prayer\nn8n's built-in **Retry On Fail is silently disabled** the moment On Error is set to a Continue option \u2014 the node proceeds on FIRST failure and the retry settings are ignored. \"I turned on retries\" and \"retries happen\" are different states, and most production workflows are quietly in the first one. So the ladder here is explicit machinery:\n\n**Full jitter** (AWS): `sleep = random(0, min(cap, base\u00b72^attempt))` \u2014 backoff alone still synchronises the herd; it's the *randomness* that decorrelates it. **Bounded at 3 attempts** (unbounded retries are how one dead dependency takes out the system), then the delivery is dead-lettered with its full attempt log, an alert fires, and the **circuit breaker** counts a strike.\n\nEvery envelope is **versioned** (`type` + `version` from the event catalog) and **signed** with the same scheme the inbound lane verifies \u2014 this hub holds itself to the standard it enforces on others.",
+        "height": 460,
+        "width": 720,
+        "color": 6
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000030",
+      "name": "Emit Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1560,
+        1400
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hub/emit",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "d5e4f3a2-0000-4000-8000-000000000002"
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000031",
+      "name": "Outbound Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1340,
+        1400
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "o0",
+              "name": "hub_secret",
+              "value": "demo-hub-secret-rotate-per-client",
+              "type": "string"
+            },
+            {
+              "id": "o1",
+              "name": "receiver_url",
+              "value": "http://localhost:5678/webhook/demo-receiver",
+              "type": "string"
+            },
+            {
+              "id": "o2",
+              "name": "max_attempts",
+              "value": "={{ 3 }}",
+              "type": "number"
+            },
+            {
+              "id": "o3",
+              "name": "backoff_base_s",
+              "value": "={{ 1.0 }}",
+              "type": "number"
+            },
+            {
+              "id": "o4",
+              "name": "backoff_cap_s",
+              "value": "={{ 8.0 }}",
+              "type": "number"
+            },
+            {
+              "id": "o5",
+              "name": "breaker_threshold",
+              "value": "={{ 3 }}",
+              "type": "number"
+            },
+            {
+              "id": "o6",
+              "name": "cooldown_s",
+              "value": "={{ 120 }}",
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000032",
+      "name": "Build Envelope",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1120,
+        1400
+      ],
+      "parameters": {
+        "jsCode": "\n// The event catalog is a CONTRACT. An unknown type is refused at the edge with a\n// 422 \u2014 not guessed at, not passed through to surprise a consumer downstream.\nconst crypto = require('crypto');\nconst CATALOG = {\"contact.updated\": 1, \"contact.created\": 1, \"appointment.booked\": 1, \"invoice.paid\": 1};\nconst b = $json.body ?? {};\nconst type = String(b.type ?? '');\nconst known = Object.prototype.hasOwnProperty.call(CATALOG, type);\nconst delivery_id = 'dlv_' + crypto.randomUUID();\nconst envelope = {\n  id: 'evt_' + crypto.randomUUID(),\n  type, version: CATALOG[type] ?? 0,\n  occurred_at: new Date().toISOString(),\n  source: 'ghl-hub',\n  data: { ...(b.data ?? {}), ...(b.target === 'fail' ? { simulate: 'fail' } : {}) },\n};\nreturn [{ json: { known_type: known, requested_type: type, delivery_id, envelope,\n  catalog: Object.keys(CATALOG) } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000033",
+      "name": "Known Type?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -900,
+        1400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.known_type }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000034",
+      "name": "Respond 422",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -680,
+        1560
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: 'unknown event type', requested: $json.requested_type, catalog: $json.catalog }) }}",
+        "options": {
+          "responseCode": 422
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000035",
+      "name": "Sign Envelope",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        1400
+      ],
+      "parameters": {
+        "jsCode": "\nconst crypto = require('crypto');\nconst cfg = $('Outbound Config').first().json;\nconst j = $('Build Envelope').first().json;\nconst body_string = JSON.stringify(j.envelope);\nconst ts = Math.floor(Date.now() / 1000);\nconst sig = crypto.createHmac('sha256', cfg.hub_secret)\n  .update(`${j.envelope.id}.${ts}.`).update(Buffer.from(body_string)).digest('base64');\nreturn [{ json: { ...j, body_string, target_url: cfg.receiver_url,\n  sig_id: j.envelope.id, sig_ts: String(ts), sig_val: 'v1,' + sig } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000036",
+      "name": "Breaker Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        1400
+      ],
+      "parameters": {
+        "jsCode": "\n// Circuit breaker: when the receiver is DOWN (not flaky), stop hammering it.\n// closed -> flow.  open -> park immediately, zero calls.  half-open (cooldown\n// elapsed) -> let ONE delivery through as the probe; its outcome closes or\n// re-opens the breaker.\nconst cfg = $('Outbound Config').first().json;\nconst sd = $getWorkflowStaticData('global');\nconst br = sd.breaker ?? { state: 'closed', fails: 0, opened_at: 0 };\nlet state = br.state;\nif (state === 'open' && Date.now() - br.opened_at >= cfg.cooldown_s * 1000) state = 'half-open';\nsd.breaker = { ...br, state };\nreturn [{ json: { ...$json, breaker_state: state, blocked: state === 'open' } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000037",
+      "name": "Breaker Open?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -240,
+        1400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.blocked }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000038",
+      "name": "Park Delivery",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -20,
+        1560
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_dlq"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "kind": "parked_breaker_open",
+            "event_id": "={{ $('Sign Envelope').first().json.sig_id }}",
+            "payload": "={{ $('Sign Envelope').first().json.body_string }}",
+            "error": "circuit breaker open \u2014 receiver is down, delivery parked without an attempt",
+            "attempt_count": "={{ 0 }}",
+            "status": "new",
+            "created_at": "={{ $now.toISO() }}",
+            "replayed_at": ""
+          },
+          "schema": [
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "payload",
+              "displayName": "payload",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "attempt_count",
+              "displayName": "attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "replayed_at",
+              "displayName": "replayed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000039",
+      "name": "Alert: Parked",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        1560
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_alerts"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "severity": "warning",
+            "message": "delivery parked: circuit breaker is open",
+            "ref": "={{ $('Sign Envelope').first().json.sig_id }}",
+            "at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ref",
+              "displayName": "ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "at",
+              "displayName": "at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000040",
+      "name": "Respond Parked",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        500,
+        1560
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ parked: true, reason: 'circuit breaker open' }) }}",
+        "options": {
+          "responseCode": 503
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000041",
+      "name": "Attempt Delivery",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -20,
+        1340
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Sign Envelope').first().json.target_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "webhook-id",
+              "value": "={{ $('Sign Envelope').first().json.sig_id }}"
+            },
+            {
+              "name": "webhook-timestamp",
+              "value": "={{ $('Sign Envelope').first().json.sig_ts }}"
+            },
+            {
+              "name": "webhook-signature",
+              "value": "={{ $('Sign Envelope').first().json.sig_val }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Sign Envelope').first().json.body_string }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000042",
+      "name": "Breaker Reset",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        1260
+      ],
+      "parameters": {
+        "jsCode": "\nconst sd = $getWorkflowStaticData('global');\nsd.attempts = sd.attempts ?? {};\nconst did = $('Build Envelope').first().json.delivery_id;\nconst attempt_no = (sd.attempts[did] ?? 0) + 1;   // failures so far + this success\ndelete sd.attempts[did];\nsd.breaker = { state: 'closed', fails: 0, opened_at: 0 };\nreturn [{ json: { attempt_no, response: $input.first().json } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000043",
+      "name": "Log Delivery",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        500,
+        1260
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_deliveries"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "delivery_id": "={{ $('Build Envelope').first().json.delivery_id }}",
+            "endpoint": "={{ $('Sign Envelope').first().json.target_url }}",
+            "attempt": "={{ $json.attempt_no }}",
+            "ok": "={{ true }}",
+            "status_code": "={{ 200 }}",
+            "detail": "delivered",
+            "at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "delivery_id",
+              "displayName": "delivery_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "endpoint",
+              "displayName": "endpoint",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "attempt",
+              "displayName": "attempt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ok",
+              "displayName": "ok",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status_code",
+              "displayName": "status_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "detail",
+              "displayName": "detail",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "at",
+              "displayName": "at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000044",
+      "name": "Respond Delivered",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        760,
+        1260
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ delivered: true, delivery_id: $('Build Envelope').first().json.delivery_id, attempts: $('Breaker Reset').first().json.attempt_no }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000045",
+      "name": "Backoff + Jitter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        1420
+      ],
+      "parameters": {
+        "jsCode": "\nconst cfg = $('Outbound Config').first().json;\nconst sd = $getWorkflowStaticData('global');\nsd.attempts = sd.attempts ?? {};\nconst did = $('Build Envelope').first().json.delivery_id;\nsd.attempts[did] = (sd.attempts[did] ?? 0) + 1;\nconst attempt = sd.attempts[did];\n// FULL JITTER (AWS): random(0, min(cap, base * 2^attempt)). Backoff shrinks retry\n// frequency; it is the randomness that decorrelates the herd.\nconst backoff_s = +(Math.random() * Math.min(cfg.backoff_cap_s,\n  cfg.backoff_base_s * Math.pow(2, attempt))).toFixed(2);\nconst e = $input.first().json;\nconst retries_left = attempt < cfg.max_attempts;\nif (!retries_left) delete sd.attempts[did];\nreturn [{ json: { attempt, max_attempts: cfg.max_attempts, backoff_s, retries_left,\n  status_code: e.error?.httpCode ?? e.error?.status ?? null,\n  error_message: String(e.error?.message ?? e.error ?? 'request failed').slice(0, 300) } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000046",
+      "name": "Log Failed Attempt",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        500,
+        1420
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_deliveries"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "delivery_id": "={{ $('Build Envelope').first().json.delivery_id }}",
+            "endpoint": "={{ $('Sign Envelope').first().json.target_url }}",
+            "attempt": "={{ $json.attempt }}",
+            "ok": "={{ false }}",
+            "status_code": "={{ $json.status_code ?? 0 }}",
+            "detail": "={{ $json.error_message }}",
+            "at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "delivery_id",
+              "displayName": "delivery_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "endpoint",
+              "displayName": "endpoint",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "attempt",
+              "displayName": "attempt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ok",
+              "displayName": "ok",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status_code",
+              "displayName": "status_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "detail",
+              "displayName": "detail",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "at",
+              "displayName": "at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000047",
+      "name": "Retries Left?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        760,
+        1420
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.retries_left }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000048",
+      "name": "Jittered Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        980,
+        1340
+      ],
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": "={{ $json.backoff_s }}",
+        "unit": "seconds"
+      },
+      "webhookId": "d5e4f3a2-0000-4000-8000-000000000003"
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000049",
+      "name": "Breaker Trip",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        980,
+        1500
+      ],
+      "parameters": {
+        "jsCode": "\nconst cfg = $('Outbound Config').first().json;\nconst sd = $getWorkflowStaticData('global');\nconst br = sd.breaker ?? { state: 'closed', fails: 0, opened_at: 0 };\nconst fails = br.fails + 1;\nconst opens = fails >= cfg.breaker_threshold;\nsd.breaker = opens\n  ? { state: 'open', fails, opened_at: Date.now() }\n  : { ...br, fails };\nreturn [{ json: { ...$input.first().json, breaker_fails: fails, breaker_opened: opens } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000050",
+      "name": "Dead-letter: Delivery",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1200,
+        1500
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_dlq"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "kind": "delivery_failed",
+            "event_id": "={{ $('Sign Envelope').first().json.sig_id }}",
+            "payload": "={{ $('Sign Envelope').first().json.body_string }}",
+            "error": "={{ $json.error_message }}",
+            "attempt_count": "={{ $json.attempt }}",
+            "status": "new",
+            "created_at": "={{ $now.toISO() }}",
+            "replayed_at": ""
+          },
+          "schema": [
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "payload",
+              "displayName": "payload",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "attempt_count",
+              "displayName": "attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "replayed_at",
+              "displayName": "replayed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000051",
+      "name": "Alert: Delivery Dead",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1460,
+        1500
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_alerts"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "severity": "critical",
+            "message": "={{ 'delivery dead-lettered after ' + $('Breaker Trip').first().json.attempt + ' attempts: ' + $('Breaker Trip').first().json.error_message }}",
+            "ref": "={{ $('Sign Envelope').first().json.sig_id }}",
+            "at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ref",
+              "displayName": "ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "at",
+              "displayName": "at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000052",
+      "name": "Respond Dead-Lettered",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1720,
+        1500
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ delivered: false, dead_lettered: true, attempts: $('Breaker Trip').first().json.attempt, breaker_opened: $('Breaker Trip').first().json.breaker_opened }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000053",
+      "name": "note-53",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1560,
+        1840
+      ],
+      "parameters": {
+        "content": "## Half-open: the part beginners omit\nAn open breaker that never re-tests stays open forever \u2014 that's an outage with extra steps. Every 5 minutes this probe checks: **is the breaker open and past its cooldown?** If so it sends ONE health request. Success closes the breaker and the system heals **without a human touching it**; failure re-stamps the cooldown and everything stays parked.",
+        "height": 240,
+        "width": 620,
+        "color": 7
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000054",
+      "name": "Breaker Probe",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1560,
+        2140
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000055",
+      "name": "Probe Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1340,
+        2140
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p0",
+              "name": "health_url",
+              "value": "http://localhost:5678/webhook/demo-receiver-health",
+              "type": "string"
+            },
+            {
+              "id": "p1",
+              "name": "cooldown_s",
+              "value": "={{ 120 }}",
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000056",
+      "name": "Half-Open Due?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1120,
+        2140
+      ],
+      "parameters": {
+        "jsCode": "\nconst cfg = $('Probe Config').first().json;\nconst sd = $getWorkflowStaticData('global');\nconst br = sd.breaker ?? { state: 'closed', fails: 0, opened_at: 0 };\nif (br.state !== 'open') return [];                       // nothing to heal\nif (Date.now() - br.opened_at < cfg.cooldown_s * 1000) return [];  // still cooling\nreturn [{ json: { probing: true, health_url: cfg.health_url } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000057",
+      "name": "Probe Receiver",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -900,
+        2140
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.health_url }}",
+        "options": {
+          "timeout": 4000
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000058",
+      "name": "Close Breaker",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        2060
+      ],
+      "parameters": {
+        "jsCode": "\nconst sd = $getWorkflowStaticData('global');\nsd.breaker = { state: 'closed', fails: 0, opened_at: 0 };\nreturn [{ json: { healed: true } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000059",
+      "name": "Alert: Breaker Closed",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -460,
+        2060
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_alerts"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "severity": "info",
+            "message": "circuit breaker closed \u2014 receiver healthy again, deliveries resume",
+            "ref": "breaker",
+            "at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ref",
+              "displayName": "ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "at",
+              "displayName": "at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000060",
+      "name": "Keep Open",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        2220
+      ],
+      "parameters": {
+        "jsCode": "\nconst sd = $getWorkflowStaticData('global');\nsd.breaker = { ...(sd.breaker ?? {}), state: 'open', opened_at: Date.now() };\nreturn [{ json: { healed: false } }];\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000061",
+      "name": "note-61",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1560,
+        2380
+      ],
+      "parameters": {
+        "content": "## Replay \u2014 root cause first, then replay\nGetting a message OUT of a DLQ is its own discipline. This endpoint re-injects **only rows marked `status=fixed`** \u2014 a human looked at the failure, fixed the cause, and flipped the status. Replaying `new` rows before the fix just re-poisons the flow with the same failure.\n\nInbound kinds re-enter at the router and travel the normal path \u2014 same normalisation, same error handling, no side door. Dead-lettered *deliveries* are re-emitted through `/hub/emit` instead, so they get a fresh signature and a fresh attempt ladder.",
+        "height": 300,
+        "width": 640,
+        "color": 4
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000062",
+      "name": "Replay Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1560,
+        2740
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hub/replay",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "d5e4f3a2-0000-4000-8000-000000000004"
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000063",
+      "name": "Replay Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1340,
+        2740
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "r0",
+              "name": "location_id",
+              "value": "YOUR_GHL_LOCATION_ID",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000064",
+      "name": "Fetch Fixed Rows",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -1120,
+        2740
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_dlq"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "status",
+              "condition": "eq",
+              "keyValue": "fixed"
+            }
+          ]
+        },
+        "returnAll": true
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000065",
+      "name": "Any Fixed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -900,
+        2740
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.id != null }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000066",
+      "name": "Mark Replayed",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -680,
+        2660
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_dlq"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $json.id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "replayed",
+            "replayed_at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "payload",
+              "displayName": "payload",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "attempt_count",
+              "displayName": "attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "replayed_at",
+              "displayName": "replayed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000067",
+      "name": "Re-inject",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        2660
+      ],
+      "parameters": {
+        "jsCode": "\nconst rows = $input.all().map(i => i.json).filter(r => r.id != null);\nconst out = [];\nfor (const r of rows) {\n  // Delivery dead-letters re-emit via /hub/emit (fresh signature, fresh ladder).\n  if (!['inbound_failed', 'unroutable', 'poison'].includes(r.kind)) continue;\n  let body = null;\n  try { body = JSON.parse(r.payload); } catch (e) { continue; }\n  if (!body || typeof body.type !== 'string') continue;\n  let loc = null;\n  try { loc = $('Replay Config').first().json.location_id; } catch (e) {}\n  out.push({ json: { event_id: r.event_id ?? ('replay_' + r.id),\n    source: 'replay:dlq#' + r.id, body, parse_ok: true, replayed_row: r.id,\n    location_id: loc } });\n}\nconst total = out.length;\nif (!total) out.push({ json: { none: true, replay_total: 0 } });\nfor (const o of out) o.json.replay_total = total;\nreturn out;\n"
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000068",
+      "name": "Respond Replayed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -240,
+        2660
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ replayed: $json.replay_total }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000069",
+      "name": "Real Replays?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        2660
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.none !== true }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b5a4c3d2-0000-4000-8000-000000000070",
+      "name": "Respond No Rows",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -680,
+        2820
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ replayed: 0, note: 'no rows with status=fixed \u2014 fix the cause first, then replay' }) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Inbound Event": {
+      "main": [
+        [
+          {
+            "node": "Hub Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hub Config": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature": {
+      "main": [
+        [
+          {
+            "node": "Authentic?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Authentic?": {
+      "main": [
+        [
+          {
+            "node": "Reserve Event ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserve Event ID": {
+      "main": [
+        [
+          {
+            "node": "New Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Event?": {
+      "main": [
+        [
+          {
+            "node": "Parse Payload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Duplicate Ack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Payload": {
+      "main": [
+        [
+          {
+            "node": "Parsed OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parsed OK?": {
+      "main": [
+        [
+          {
+            "node": "Ack 202",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ack Poison 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ack 202": {
+      "main": [
+        [
+          {
+            "node": "Route Event Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Event Type": {
+      "main": [
+        [
+          {
+            "node": "Normalize Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Shape For DLQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Contact": {
+      "main": [
+        [
+          {
+            "node": "GHL: Upsert Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Appointment": {
+      "main": [
+        [
+          {
+            "node": "GHL: Stamp Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Upsert Contact": {
+      "main": [
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Shape For DLQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Stamp Booking": {
+      "main": [
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Shape For DLQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Outcome": {
+      "main": [
+        [
+          {
+            "node": "Log Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Rejection": {
+      "main": [
+        [
+          {
+            "node": "Shape For DLQ",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Reject 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ack Poison 200": {
+      "main": [
+        [
+          {
+            "node": "Shape For DLQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape For DLQ": {
+      "main": [
+        [
+          {
+            "node": "Scrub Secrets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrub Secrets": {
+      "main": [
+        [
+          {
+            "node": "Dead-letter: Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dead-letter: Inbound": {
+      "main": [
+        [
+          {
+            "node": "Alert: Inbound Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Emit Request": {
+      "main": [
+        [
+          {
+            "node": "Outbound Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outbound Config": {
+      "main": [
+        [
+          {
+            "node": "Build Envelope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Envelope": {
+      "main": [
+        [
+          {
+            "node": "Known Type?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Known Type?": {
+      "main": [
+        [
+          {
+            "node": "Sign Envelope",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 422",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign Envelope": {
+      "main": [
+        [
+          {
+            "node": "Breaker Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker Gate": {
+      "main": [
+        [
+          {
+            "node": "Breaker Open?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker Open?": {
+      "main": [
+        [
+          {
+            "node": "Park Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Attempt Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Park Delivery": {
+      "main": [
+        [
+          {
+            "node": "Alert: Parked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert: Parked": {
+      "main": [
+        [
+          {
+            "node": "Respond Parked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attempt Delivery": {
+      "main": [
+        [
+          {
+            "node": "Breaker Reset",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Backoff + Jitter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker Reset": {
+      "main": [
+        [
+          {
+            "node": "Log Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Delivery": {
+      "main": [
+        [
+          {
+            "node": "Respond Delivered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff + Jitter": {
+      "main": [
+        [
+          {
+            "node": "Log Failed Attempt",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Retries Left?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retries Left?": {
+      "main": [
+        [
+          {
+            "node": "Jittered Wait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Breaker Trip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jittered Wait": {
+      "main": [
+        [
+          {
+            "node": "Attempt Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker Trip": {
+      "main": [
+        [
+          {
+            "node": "Dead-letter: Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dead-letter: Delivery": {
+      "main": [
+        [
+          {
+            "node": "Alert: Delivery Dead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert: Delivery Dead": {
+      "main": [
+        [
+          {
+            "node": "Respond Dead-Lettered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker Probe": {
+      "main": [
+        [
+          {
+            "node": "Probe Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Probe Config": {
+      "main": [
+        [
+          {
+            "node": "Half-Open Due?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Half-Open Due?": {
+      "main": [
+        [
+          {
+            "node": "Probe Receiver",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Probe Receiver": {
+      "main": [
+        [
+          {
+            "node": "Close Breaker",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Keep Open",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close Breaker": {
+      "main": [
+        [
+          {
+            "node": "Alert: Breaker Closed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Request": {
+      "main": [
+        [
+          {
+            "node": "Replay Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Config": {
+      "main": [
+        [
+          {
+            "node": "Fetch Fixed Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Fixed Rows": {
+      "main": [
+        [
+          {
+            "node": "Any Fixed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Fixed?": {
+      "main": [
+        [
+          {
+            "node": "Mark Replayed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond No Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Replayed": {
+      "main": [
+        [
+          {
+            "node": "Re-inject",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-inject": {
+      "main": [
+        [
+          {
+            "node": "Respond Replayed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Replayed": {
+      "main": [
+        [
+          {
+            "node": "Real Replays?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Real Replays?": {
+      "main": [
+        [
+          {
+            "node": "Route Event Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "hubErrorWf000001"
+  },
+  "id": "webhookHub000001"
+}

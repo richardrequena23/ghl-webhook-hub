@@ -1,0 +1,153 @@
+{
+  "name": "Demo External System \u2014 Receiver",
+  "nodes": [
+    {
+      "id": "f5a4b3c2-0000-4000-8000-000000000077",
+      "name": "note-header",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -360,
+        -240
+      ],
+      "parameters": {
+        "content": "## Demo stand-in for the client's external system\nReceives the hub's signed deliveries. A payload carrying `simulate: \"fail\"` gets a 500 \u2014 that is how the retry ladder, the dead-letter path and the circuit breaker are demonstrated **live** instead of claimed. `GET /demo-receiver-health` is the breaker's probe target.",
+        "height": 240,
+        "width": 460,
+        "color": 7
+      }
+    },
+    {
+      "id": "f5a4b3c2-0000-4000-8000-000000000078",
+      "name": "Receiver",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -360,
+        60
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "demo-receiver",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "f5a4b3c2-0000-4000-8000-000000000001"
+    },
+    {
+      "id": "f5a4b3c2-0000-4000-8000-000000000079",
+      "name": "Fail?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -140,
+        60
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.body.data?.simulate === 'fail' }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "f5a4b3c2-0000-4000-8000-000000000080",
+      "name": "Respond 500",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        120,
+        -20
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: 'simulated downstream failure' }) }}",
+        "options": {
+          "responseCode": 500
+        }
+      }
+    },
+    {
+      "id": "f5a4b3c2-0000-4000-8000-000000000081",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        120,
+        160
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ received: true, id: $json.body.id }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "f5a4b3c2-0000-4000-8000-000000000082",
+      "name": "Health",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -360,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "demo-receiver-health",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "f5a4b3c2-0000-4000-8000-000000000002"
+    }
+  ],
+  "connections": {
+    "Receiver": {
+      "main": [
+        [
+          {
+            "node": "Fail?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fail?": {
+      "main": [
+        [
+          {
+            "node": "Respond 500",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "hubReceiver00001"
+}

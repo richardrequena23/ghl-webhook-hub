@@ -1,0 +1,5 @@
+{
+  "note": "DEMO keypair for the webhook hub Ed25519 lane — stands in for GoHighLevel signing key in local tests. NOT a secret that protects anything.",
+  "publicPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAIjPUavhA/dmHNTeFuXK0KKVA5Ig+uMfXCip0X3JzPdM=\n-----END PUBLIC KEY-----\n",
+  "privatePem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJzSiJZif0L1JlWNvATx965Z+rL+o75ql3VrGWgzRz16\n-----END PRIVATE KEY-----\n"
+}

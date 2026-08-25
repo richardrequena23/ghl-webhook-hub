@@ -1,0 +1,288 @@
+{
+  "name": "Hub Error Workflow \u2014 DLQ Writer",
+  "nodes": [
+    {
+      "id": "e5f4a3b2-0000-4000-8000-000000000071",
+      "name": "note-header",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -360,
+        -260
+      ],
+      "parameters": {
+        "content": "## One error workflow, every workflow\nAttached via `settings \u2192 Error workflow` \u2014 defined ONCE, reused everywhere, so the failure story can't drift between flows.\n\nTwo payload shapes arrive here: a normal node failure carries `execution.id` + a clickable `execution.url`; a **trigger-node** failure carries neither. The logger handles both \u2014 the failures with the least context are exactly the ones you can't afford to drop on the floor.",
+        "height": 300,
+        "width": 460,
+        "color": 3
+      }
+    },
+    {
+      "id": "e5f4a3b2-0000-4000-8000-000000000072",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -360,
+        100
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "e5f4a3b2-0000-4000-8000-000000000073",
+      "name": "Shape Error Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -140,
+        100
+      ],
+      "parameters": {
+        "jsCode": "\nconst j = $input.first().json;\n// Trigger-node failures have NO execution object \u2014 j.trigger carries the error.\nconst ex = j.execution ?? {};\nconst err = ex.error ?? j.trigger?.error ?? {};\nreturn [{ json: {\n  kind: 'workflow_error',\n  event_id: ex.id ? ('exec#' + ex.id) : 'trigger-failure',\n  payload: JSON.stringify({\n    workflow: j.workflow?.name ?? 'unknown',\n    failed_node: ex.lastNodeExecuted ?? 'trigger',\n    execution_url: ex.url ?? null,\n    retry_of: ex.retryOf ?? null,\n  }),\n  error_message: String(err.message ?? 'unknown error').slice(0, 300),\n} }];\n"
+      }
+    },
+    {
+      "id": "e5f4a3b2-0000-4000-8000-000000000074",
+      "name": "Scrub Secrets",
+      "type": "@n8n/n8n-nodes-langchain.guardrails",
+      "typeVersion": 2,
+      "position": [
+        80,
+        100
+      ],
+      "parameters": {
+        "operation": "sanitize",
+        "text": "={{ $json.payload }}",
+        "guardrails": {
+          "secretKeys": {
+            "value": {
+              "permissiveness": "balanced"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "e5f4a3b2-0000-4000-8000-000000000075",
+      "name": "DLQ: Unexpected Failure",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        360,
+        100
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_dlq"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "kind": "={{ $('Shape Error Row').item.json.kind }}",
+            "event_id": "={{ $('Shape Error Row').item.json.event_id }}",
+            "payload": "={{ $json.guardrailsInput }}",
+            "error": "={{ $('Shape Error Row').item.json.error_message }}",
+            "attempt_count": "={{ 1 }}",
+            "status": "new",
+            "created_at": "={{ $now.toISO() }}",
+            "replayed_at": ""
+          },
+          "schema": [
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "payload",
+              "displayName": "payload",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error",
+              "displayName": "error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "attempt_count",
+              "displayName": "attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "replayed_at",
+              "displayName": "replayed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "e5f4a3b2-0000-4000-8000-000000000076",
+      "name": "Alert: Workflow Error",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        580,
+        100
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "hub_alerts"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "severity": "critical",
+            "message": "={{ 'workflow failure: ' + $('Shape Error Row').item.json.error_message }}",
+            "ref": "={{ $('Shape Error Row').item.json.event_id }}",
+            "at": "={{ $now.toISO() }}"
+          },
+          "schema": [
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ref",
+              "displayName": "ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "at",
+              "displayName": "at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Shape Error Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Error Row": {
+      "main": [
+        [
+          {
+            "node": "Scrub Secrets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrub Secrets": {
+      "main": [
+        [
+          {
+            "node": "DLQ: Unexpected Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DLQ: Unexpected Failure": {
+      "main": [
+        [
+          {
+            "node": "Alert: Workflow Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "hubErrorWf000001"
+}

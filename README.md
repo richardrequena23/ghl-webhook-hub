@@ -1,6 +1,104 @@
 # ghl-webhook-hub
 
-A signed, idempotent, dead-lettered webhook integration hub for GoHighLevel, built in n8n.
-Full build — workflows, generator, 18-case contract test suite, and proof screenshots — landing via PR.
+**A signed, idempotent, dead-lettered webhook integration hub for GoHighLevel, built in n8n — with an 18-case contract test suite that proves every claim over the wire.**
 
-MIT licensed.
+Most webhook integrations are a URL and a prayer. Of 685 webhook-triggered workflows in a 4,430-workflow n8n template corpus I mined before building this: 18.1% have *any* error handling, 8.2% use *any* authentication, and **0 build a dead-letter path**. This hub is the opposite — the unhappy path is the product.
+
+![The hub canvas — four lanes: signed ingress, outbound delivery ladder, breaker probe, DLQ replay](images/canvas-hub.png)
+
+## Why this exists right now
+
+GoHighLevel is retiring its legacy RSA webhook signature: per the official [Webhook Integration Guide](https://marketplace.gohighlevel.com/docs/webhook/WebhookIntegrationGuide/index.html), **the `X-WH-Signature` header is deprecated on September 1, 2026**, replaced by `X-GHL-Signature` — an Ed25519 signature over the raw request body, verified against GHL's published public key. Any integration still verifying only the legacy header stops being verifiable after that date.
+
+This hub already verifies the new scheme.
+
+## What it does
+
+**Inbound** (`POST /webhook/hub/inbound`) — two verification lanes:
+
+- **GoHighLevel marketplace deliveries:** `X-GHL-Signature`, Ed25519 over the raw body, checked against a configurable public-key list (GHL's official key first — key lists make zero-downtime rotation possible). GHL's signature carries no timestamp, so replay defence on this lane is event-id dedupe — scoped honestly, not hand-waved.
+- **Everything else:** the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks) scheme — HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{raw body}`, base64, `v1,` prefix, **timing-safe compare**, ±300s timestamp tolerance (Stripe's library default) plus a future-skew bound. Signature is computed over the **raw bytes** the request arrived with, never a re-serialized parse.
+
+Then, in order: **idempotency reservation** before any side effect (a duplicate delivery gets back the *recorded outcome* of the first — same answer, zero repeated work; dedupe TTL outlives the sender's retry window) → **ack fast** (202 leaves before the CRM write happens; senders retry slow handlers, and that retry manufactures duplicates) → **route by event type** (unknown types dead-letter — the fallback output is wired, because n8n's default silently *drops* unmatched items) → **upsert into GHL** (`POST /contacts/upsert`, keyed on normalized email/full-digit phone, source-stamped; never a blind create, so a replay is a no-op) → event ledger row.
+
+A malformed-but-authentic payload is **acked 200 and dead-lettered, never 500'd**: GHL redelivers non-2xx responses up to 12 times, so refusing a poison message just means twelve more copies of it.
+
+**Outbound** (`POST /webhook/hub/emit`):
+
+- A **versioned event catalog** enforced at the edge — unknown types get a 422 naming the catalog, they don't surprise a consumer downstream.
+- Envelopes are **signed with the same Standard Webhooks scheme the inbound lane verifies** — the hub holds itself to the standard it enforces on others.
+- A **retry ladder with full jitter** — `sleep = random(0, min(cap, base·2^attempt))`, bounded at 3 attempts, every attempt logged. Hand-built, because n8n's native retry is clamped to 5 tries × 5s *fixed* wait (`n8n-core/…/workflow-execute.js`), and is **silently disabled** the moment a node's On Error is set to a Continue option — a bug 164 nodes in the public corpus ship without knowing it.
+- A **circuit breaker** (closed / open / half-open): three consecutive dead-lettered deliveries open it; an open breaker parks deliveries with *zero* attempts; a scheduled probe re-tests the receiver's health after cooldown and closes it — self-healing, no human required.
+
+**Dead letters + replay** (`POST /webhook/hub/replay`):
+
+- Every failure lands in a native n8n Data Table with the full sanitized payload, error, attempt count, and a **status lifecycle**: `new → fixed → replayed`.
+- Replay only touches rows a human marked `fixed` — **root cause first, then replay**, or you re-poison the flow with the same failure.
+- Replayed inbound events re-enter at the router and travel the normal path. No side doors.
+- A **shared error workflow** (`Error Trigger`) catches anything unexpected across all three workflows and writes it to the same DLQ — including trigger-node failures, which arrive with a different payload shape and no execution id.
+- Credentials can never land in the log: an n8n Guardrails node (`secretKeys`, deterministic — no model attached) scrubs every payload before it's stored. Deliberately *not* PII-scrubbing: emails and phones are the CRM's own data, and redacting them would make dead letters unreplayable. That trade-off is written on the canvas where a reviewer can disagree with it.
+
+![The dead-letter queue — every failure kind, with its status lifecycle](images/table-dlq.png)
+
+## The proof
+
+`tools/test_webhook_hub.py` fires 18 contract cases at the running hub and asserts on **stored table state over REST**, not just HTTP responses:
+
+| # | Case | Expects |
+|---|---|---|
+| 1 | valid signed event | 202 accepted |
+| 2 | the same delivery again | 200 + the recorded outcome of the first |
+| 3 | stored state for the pair | exactly ONE processed event row |
+| 4 | tampered body | 401 |
+| 5 | stale timestamp (400s) | 401 |
+| 6 | future timestamp (+120s) | 401 |
+| 7 | missing signature | 401 |
+| 8 | authentic but unroutable type | 202 + DLQ row `unroutable` |
+| 9 | authentic garbage (poison) | 200 ack + DLQ row, never a 5xx |
+| 10 | emit to healthy receiver | delivered on attempt 1 |
+| 11 | replay with nothing fixed | `replayed: 0` |
+| 12 | fix the DLQ row, replay | processed via the normal path + marked `replayed` |
+| 13 | emit unknown type | 422 with the catalog |
+| 14 | valid `X-GHL-Signature` (Ed25519) | 202 + processed |
+| 15 | tampered body on the GHL lane | 401 |
+| 16 | failing receiver ×3 | 3 bounded jittered attempts each, then dead-lettered |
+| 17 | third consecutive dead-letter | trips the breaker |
+| 18 | emit while breaker open | parked with ZERO attempts (503) |
+
+**18/18 passing.** The suite deliberately ends with the breaker open; minutes later the probe lane closes it on its own — the alert log below is one unedited incident story, ending in the self-heal:
+
+![The alert log — rejections, dead-letters, the park, and the breaker closing itself](images/table-alerts.png)
+
+![Every delivery attempt logged — including the jittered failed ladders](images/table-deliveries.png)
+
+## Run it
+
+Requirements: self-hosted n8n ≥ 2.35 with Data Tables, Node 18+, Python 3.9+.
+
+```bash
+# 1. n8n must allow the crypto builtin in Code nodes (signature verification):
+export NODE_FUNCTION_ALLOW_BUILTIN=crypto
+n8n start
+
+# 2. generate, provision the four data tables, import all three workflows:
+export N8N_EMAIL=you@example.com N8N_PASSWORD=... GHL_LOCATION_ID=...
+python3 tools/build_webhook_hub.py --provision --import
+# restart n8n so the imported webhooks register
+
+# 3. prove it:
+python3 tools/test_webhook_hub.py
+```
+
+The generator is the source of truth — the canvas is never hand-edited. It also refuses to build anything unverifiable: it mechanically asserts that every CRM write has its error output **wired**, that retries are bounded, that the dedupe reservation sits upstream of every side effect, that no node overlaps another on the canvas, and that no credential-shaped literal exists in the emitted JSON.
+
+`tools/demo-ed25519.json` is a demo keypair standing in for GoHighLevel's signer in local tests (GHL holds the real private key); the config carries GHL's official public key first, so pointing real marketplace deliveries at the hub needs no changes.
+
+## Honest limits
+
+- This is a single-instance demo: the idempotency reservation uses workflow static data (with the durable ledger in a Data Table). Horizontal scale moves the reservation to Redis/Postgres.
+- The demo ladder is compressed (seconds, 3 attempts) so a full failure story fits in one execution log; a production ladder stretches the same machinery toward Svix's published schedule (8 attempts over ~28h).
+- GHL's `tags` field on upsert **overwrites** the contact's whole tag list — a production deployment fetches and merges before tagging. Documented rather than hidden.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
