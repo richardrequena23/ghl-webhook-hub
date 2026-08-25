@@ -71,6 +71,25 @@ A malformed-but-authentic payload is **acked 200 and dead-lettered, never 500'd*
 
 ![Every delivery attempt logged — including the jittered failed ladders](images/table-deliveries.png)
 
+## The chaos test — receiver death mid-delivery
+
+The contract suite proves each mechanism in isolation. `tools/chaos_receiver_death.py` proves they compose under real failure: a batch of 20 outbound events, and the receiving system **dies partway through the batch** (its workflow is deactivated — endpoints return 404, exactly like a crashed service; not a simulated-error payload).
+
+What has to happen, and is asserted on stored table state end to end:
+
+1. Events 01–10 deliver on attempt 1 while the receiver is healthy.
+2. The receiver dies. Events 11–13 each run the full 3-attempt jittered ladder (every 404 logged to `hub_deliveries`) and dead-letter; the third dead letter **trips the circuit breaker**.
+3. Events 14–20 are **parked with zero attempts** (503) — the breaker refuses to hammer a dead dependency. All 10 outage events are caught in `hub_dlq`, each exactly once.
+4. The receiver comes back. Nobody touches the hub: the probe lane notices on its own schedule and **closes the breaker** (the `circuit breaker closed` alert row is the assertion).
+5. Every dead letter is triaged `fixed` and re-emitted through `/hub/emit` — fresh envelope, fresh signature, fresh ladder — then marked `replayed`.
+6. The ledger must balance exactly: **delivered(10) + drained(10) == 20, zero lost, zero duplicated** — one successful-delivery row per event across the whole incident, zero DLQ rows left `new`/`fixed`, and the inbound event ledger untouched.
+
+```bash
+python3 tools/chaos_receiver_death.py   # n8n up, hub + receiver active
+```
+
+Exit 0 only if the ledger balances and the DLQ drains to zero. The kill lands between delivery 10 and 11 of the batch — emits are synchronous, so "mid-delivery" for a sequential batch means mid-batch, stated honestly.
+
 ## Run it
 
 Requirements: self-hosted n8n ≥ 2.35 with Data Tables, Node 18+, Python 3.9+.
