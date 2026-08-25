@@ -99,6 +99,21 @@ The generator is the source of truth — the canvas is never hand-edited. It als
 - The demo ladder is compressed (seconds, 3 attempts) so a full failure story fits in one execution log; a production ladder stretches the same machinery toward Svix's published schedule (8 attempts over ~28h).
 - GHL's `tags` field on upsert **overwrites** the contact's whole tag list — a production deployment fetches and merges before tagging. Documented rather than hidden.
 
+## Where the corpus numbers come from
+
+`tools/webhook_corpus_stats.py` is the miner that produced the headline statistics — a scripted walk over 4,430 parseable workflows from the public n8n template corpus (awesome-n8n-workflows, n8n-workflow-templates, awesome-n8n-templates). A workflow counts as webhook-triggered only if it *contains an actual Webhook node* — filename matching inflates the count nearly 3x. The numbers were independently re-verified by a second, differently-implemented count before being quoted anywhere:
+
+| Statistic | Count |
+|---|---|
+| Webhook-triggered workflows | 685 / 4,430 (15.5%) |
+| …with ANY error handling | 124 (18.1%) |
+| …with any retry | 39 (5.7%) |
+| …with any webhook auth | 56 (8.2%) |
+| …with an error workflow attached | 6 (0.9%) |
+| …with a dead-letter path | **0** |
+| …combining signature + freshness + event-id dedupe | **0** |
+| …doing a CRM upsert from a webhook | **0** |
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
