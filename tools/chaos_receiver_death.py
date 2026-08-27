@@ -48,7 +48,7 @@ try:  # local rig: Keychain-backed creds; anywhere else: env vars
     import pathlib as _pl
     sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
     import n8nauth as _n8nauth
-    EMAIL = "richardarequena@proton.me"
+    EMAIL = _n8nauth.EMAIL
     PASSWORD = _n8nauth.password()
 except ImportError:
     EMAIL = os.environ.get("N8N_EMAIL", "")
